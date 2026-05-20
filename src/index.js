@@ -354,3 +354,25 @@ app.post("/applications", async (request, response) => {
     response.status(500).json({ error: error.message || "Could not submit application" });
   }
 });
+client.once("ready", () => {
+  loadApplicationsFromDisk();
+  console.log(`LS Mongolia application bot online as ${client.user.tag}`);
+});
+
+app.listen(PORT, () => {
+  console.log(`LS Mongolia application API listening on port ${PORT}`);
+});
+
+const discordToken = String(process.env.DISCORD_TOKEN || "")
+  .trim()
+  .replace(/^Bot\s+/i, "");
+
+if(!discordToken){
+  console.error("DISCORD_TOKEN is missing. Add it in Render Environment variables.");
+  process.exit(1);
+}
+
+client.login(discordToken).catch(error => {
+  console.error("Discord bot login failed:", error);
+  process.exit(1);
+});

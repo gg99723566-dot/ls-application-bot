@@ -31,7 +31,18 @@ const roleConfig = {
   policeChief: splitIds(process.env.POLICE_CHIEF_ROLE_IDS),
   medicChief: splitIds(process.env.MEDIC_CHIEF_ROLE_IDS),
   police: splitIds(process.env.POLICE_ROLE_IDS),
-  medic: splitIds(process.env.MEDIC_ROLE_IDS)
+  medic: splitIds(process.env.MEDIC_ROLE_IDS),
+  accepted: splitIds(process.env.ACCEPTED_ROLE_ID)
+};
+
+const roleLabels = {
+  admin: "Admin",
+  staff: "Staff",
+  policeChief: "Цагдаа дарга",
+  medicChief: "Эмнэлэг дарга",
+  police: "Цагдаа",
+  medic: "Эмнэлэг",
+  accepted: "Accepted"
 };
 
 const app = express();
@@ -107,6 +118,33 @@ function accessForMember(member, user){
       viewPublic:true
     }
   };
+}
+
+function configuredRoleEntries(){
+  return Object.entries(roleConfig)
+    .filter(([key]) => key !== "adminUsers")
+    .flatMap(([key, ids]) => ids.map(id => ({ key, id, label:roleLabels[key] || key })));
+}
+
+function roleKeysForMember(member){
+  if(!member) return [];
+  const roles = [...member.roles.cache.keys()];
+  return configuredRoleEntries()
+    .filter(entry => roles.includes(entry.id))
+    .map(entry => ({
+      key:entry.key,
+      label:entry.label,
+      id:entry.id,
+      name:member.guild.roles.cache.get(entry.id)?.name || entry.label
+    }));
+}
+
+async function accessFromRequest(request){
+  const user = await userFromBearer(request);
+  if(!user) return null;
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const member = await guild.members.fetch(user.id);
+  return { user, guild, member, access:accessForMember(member, user) };
 }
 
 async function userFromBearer(request){
@@ -212,7 +250,13 @@ function actionRows(applicationId, disabled = false){
 function canReview(member){
   if(!member) return false;
   if(member.permissions.has(PermissionFlagsBits.ManageGuild)) return true;
-  return STAFF_ROLE_ID ? member.roles.cache.has(STAFF_ROLE_ID) : true;
+  const roles = [...member.roles.cache.keys()];
+  return hasAnyRole(roles, [
+    ...roleConfig.admin,
+    ...roleConfig.staff,
+    ...roleConfig.policeChief,
+    ...roleConfig.medicChief
+  ]);
 }
 
 const applications = new Map();
@@ -267,6 +311,45 @@ function applicationListForAccess(access){
       ? `https://discord.com/channels/${GUILD_ID}/${item.channelId}/${item.messageId}`
       : ""
   }));
+}
+
+function canReviewApplication(access, application){
+  if(access.groups.admin || access.groups.staff) return true;
+  if(access.permissions.managePolice && application.roleKey === "police") return true;
+  if(access.permissions.manageMedic && application.roleKey === "medic") return true;
+  return false;
+}
+
+async function finalizeApplicationReview(application, status, reviewedBy, guild){
+  application.status = status;
+  application.reviewedBy = reviewedBy;
+  application.reviewedAt = new Date().toISOString();
+  saveApplication(application);
+
+  let roleAdded = false;
+  let dmSent = false;
+
+  if(String(status).startsWith("Accepted") && ACCEPTED_ROLE_ID && application.applicant.discordId && guild){
+    try{
+      const member = await guild.members.fetch(application.applicant.discordId);
+      await member.roles.add(ACCEPTED_ROLE_ID);
+      roleAdded = true;
+    }catch(error){
+      console.warn("Could not add accepted role:", error.message);
+    }
+  }
+
+  if(application.applicant.discordId){
+    try{
+      const user = await client.users.fetch(application.applicant.discordId);
+      await user.send(`Таны LS Mongolia анкет: ${status}`);
+      dmSent = true;
+    }catch(error){
+      console.warn("Could not DM applicant:", error.message);
+    }
+  }
+
+  return { roleAdded, dmSent };
 }
 
 app.get("/health", (request, response) => {
@@ -325,35 +408,214 @@ app.get("/applications", async (request, response) => {
   }
 });
 
+app.get("/roles/members", async (request, response) => {
+  try{
+    if(!client.isReady()) return response.status(503).json({ error: "Bot is not ready" });
+    const context = await accessFromRequest(request);
+    if(!context) return response.status(401).json({ error: "Discord login required" });
+    if(!context.access.permissions.viewAdmin){
+      return response.status(403).json({ error: "Admin access required" });
+    }
+
+    await context.guild.members.fetch();
+    const members = context.guild.members.cache
+      .filter(member => !member.user.bot)
+      .map(member => ({
+        id:member.id,
+        username:member.user.username,
+        displayName:member.displayName || member.user.globalName || member.user.username,
+        roles:roleKeysForMember(member)
+      }))
+      .filter(member => member.roles.length)
+      .sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+    response.json({
+      ok:true,
+      roles:configuredRoleEntries().map(entry => ({
+        key:entry.key,
+        id:entry.id,
+        label:entry.label,
+        name:context.guild.roles.cache.get(entry.id)?.name || entry.label
+      })),
+      members
+    });
+  }catch(error){
+    console.error("/roles/members failed:", error);
+    response.status(500).json({ error: "Could not load role members" });
+  }
+});
+
+app.patch("/members/:id/roles", async (request, response) => {
+  try{
+    if(!client.isReady()) return response.status(503).json({ error: "Bot is not ready" });
+    const context = await accessFromRequest(request);
+    if(!context) return response.status(401).json({ error: "Discord login required" });
+    if(!context.access.permissions.viewAdmin){
+      return response.status(403).json({ error: "Admin access required" });
+    }
+
+    const roleKey = String((request.body || {}).roleKey || "");
+    const action = String((request.body || {}).action || "add").toLowerCase();
+    const roleIds = roleConfig[roleKey] || [];
+    if(!roleIds.length) return response.status(400).json({ error: "Role ID is not configured" });
+
+    const target = await context.guild.members.fetch(request.params.id).catch(() => null);
+    if(!target) return response.status(404).json({ error: "User is not in this Discord server" });
+
+    const botMember = context.guild.members.me || await context.guild.members.fetchMe();
+    if(!botMember.permissions.has(PermissionFlagsBits.ManageRoles)){
+      return response.status(403).json({ error: "Bot needs Manage Roles permission" });
+    }
+
+    for(const roleId of roleIds){
+      const role = context.guild.roles.cache.get(roleId) || await context.guild.roles.fetch(roleId).catch(() => null);
+      if(!role) return response.status(400).json({ error: `Configured role not found: ${roleId}` });
+      if(role.managed) return response.status(400).json({ error: `${role.name} is managed by an integration` });
+      if(botMember.roles.highest.comparePositionTo(role) <= 0){
+        return response.status(403).json({ error: `Move the bot role above ${role.name}` });
+      }
+      if(context.member.roles.highest.comparePositionTo(role) <= 0 && context.guild.ownerId !== context.member.id){
+        return response.status(403).json({ error: `Your Discord role must be above ${role.name}` });
+      }
+      if(action === "remove"){
+        await target.roles.remove(roleId);
+      }else{
+        await target.roles.add(roleId);
+      }
+    }
+
+    response.json({
+      ok:true,
+      member:{
+        id:target.id,
+        username:target.user.username,
+        displayName:target.displayName || target.user.globalName || target.user.username,
+        roles:roleKeysForMember(target)
+      }
+    });
+  }catch(error){
+    console.error("/members/:id/roles failed:", error);
+    response.status(500).json({ error: error.message || "Could not update role" });
+  }
+});
+
 app.post("/applications", async (request, response) => {
   try{
     if(!client.isReady()) return response.status(503).json({ error: "Bot is not ready" });
-    if(!APPLICATION_CHANNEL_ID) return response.status(500).json({ error: "APPLICATION_CHANNEL_ID is missing" });
 
     const application = normalizeApplication(request.body || {});
-    const channel = await client.channels.fetch(APPLICATION_CHANNEL_ID);
-    if(!channel || !channel.isTextBased()) return response.status(500).json({ error: "Application channel is invalid" });
-
-    const message = await channel.send({
-      content: "Police Application Application Submitted",
-      embeds: [applicationEmbed(application)],
-      components: actionRows(application.id)
-    });
-
-    saveApplication({
+    const savedApplication = {
       ...application,
       submittedAt:new Date().toISOString(),
       status:"Pending",
-      messageId: message.id,
-      channelId: message.channelId
-    });
+      messageId:"",
+      channelId:""
+    };
 
-    response.status(201).json({ ok: true, applicationId: application.id, messageUrl: message.url });
+    let messageUrl = "";
+    let discordWarning = "";
+
+    if(APPLICATION_CHANNEL_ID){
+      try{
+        const channel = await client.channels.fetch(APPLICATION_CHANNEL_ID);
+        if(channel && channel.isTextBased()){
+          const message = await channel.send({
+            content: "Police Application Application Submitted",
+            embeds: [applicationEmbed(application)],
+            components: actionRows(application.id)
+          });
+          savedApplication.messageId = message.id;
+          savedApplication.channelId = message.channelId;
+          messageUrl = message.url;
+        }else{
+          discordWarning = "Application channel is invalid";
+        }
+      }catch(error){
+        discordWarning = error.message || "Discord channel send failed";
+        console.warn("Discord application send skipped:", error);
+      }
+    }else{
+      discordWarning = "APPLICATION_CHANNEL_ID is missing";
+    }
+
+    saveApplication(savedApplication);
+
+    response.status(201).json({
+      ok:true,
+      applicationId:application.id,
+      messageUrl,
+      warning:discordWarning
+    });
   }catch(error){
     console.error("/applications submit failed:", error);
     response.status(500).json({ error: error.message || "Could not submit application" });
   }
 });
+
+app.patch("/applications/:id/review", async (request, response) => {
+  try{
+    if(!client.isReady()) return response.status(503).json({ error: "Bot is not ready" });
+
+    const user = await userFromBearer(request);
+    if(!user) return response.status(401).json({ error: "Discord login required" });
+
+    const application = applications.get(request.params.id);
+    if(!application) return response.status(404).json({ error: "Application not found" });
+
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const member = await guild.members.fetch(user.id);
+    const access = accessForMember(member, user);
+    if(!canReviewApplication(access, application)){
+      return response.status(403).json({ error: "No review access" });
+    }
+
+    const requestedStatus = String((request.body || {}).status || "").toLowerCase();
+    const status = requestedStatus === "denied" ? "Denied" : "Accepted";
+    const result = await finalizeApplicationReview(application, status, user.id, guild);
+
+    response.json({ ok:true, item:application, ...result });
+  }catch(error){
+    console.error("/applications/:id/review failed:", error);
+    response.status(500).json({ error: "Could not review application" });
+  }
+});
+
+client.on("interactionCreate", async interaction => {
+  if(!interaction.isButton()) return;
+  if(!interaction.customId.startsWith("lsapp:")) return;
+
+  const [, action, applicationId] = interaction.customId.split(":");
+  const application = applications.get(applicationId);
+
+  if(!canReview(interaction.member)){
+    await interaction.reply({ content: "Энэ анкетыr шийдэх эрх байхгүй байна.", ephemeral: true });
+    return;
+  }
+
+  if(!application){
+    await interaction.reply({ content: "Энэ application bot restart хийсний дараах хуучин анкет байна.", ephemeral: true });
+    return;
+  }
+
+  if(action === "history"){
+    await interaction.reply({ content: `Application ID: ${applicationId}\nStatus: ${application.status || "Pending"}`, ephemeral: true });
+    return;
+  }
+
+  if(action === "ticket"){
+    await interaction.reply({ content: "Ticket үүсгэх logic дараагийн хувилбарт нэмэгдэнэ.", ephemeral: true });
+    return;
+  }
+
+  const status = statusLabels[action] || "Reviewed";
+  await finalizeApplicationReview(application, status, interaction.user.id, interaction.guild);
+
+  await interaction.update({
+    embeds: [applicationEmbed(application, status)],
+    components: actionRows(applicationId, true)
+  });
+});
+
 client.once("ready", () => {
   loadApplicationsFromDisk();
   console.log(`LS Mongolia application bot online as ${client.user.tag}`);

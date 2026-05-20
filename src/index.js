@@ -326,106 +326,31 @@ app.get("/applications", async (request, response) => {
 });
 
 app.post("/applications", async (request, response) => {
-  if(!client.isReady()) return response.status(503).json({ error: "Bot is not ready" });
-  if(!APPLICATION_CHANNEL_ID) return response.status(500).json({ error: "APPLICATION_CHANNEL_ID is missing" });
+  try{
+    if(!client.isReady()) return response.status(503).json({ error: "Bot is not ready" });
+    if(!APPLICATION_CHANNEL_ID) return response.status(500).json({ error: "APPLICATION_CHANNEL_ID is missing" });
 
-  const application = normalizeApplication(request.body || {});
-  const channel = await client.channels.fetch(APPLICATION_CHANNEL_ID);
-  if(!channel || !channel.isTextBased()) return response.status(500).json({ error: "Application channel is invalid" });
+    const application = normalizeApplication(request.body || {});
+    const channel = await client.channels.fetch(APPLICATION_CHANNEL_ID);
+    if(!channel || !channel.isTextBased()) return response.status(500).json({ error: "Application channel is invalid" });
 
-  const message = await channel.send({
-    content: "Police Application Application Submitted",
-    embeds: [applicationEmbed(application)],
-    components: actionRows(application.id)
-  });
+    const message = await channel.send({
+      content: "Police Application Application Submitted",
+      embeds: [applicationEmbed(application)],
+      components: actionRows(application.id)
+    });
 
-  saveApplication({
-    ...application,
-    submittedAt:new Date().toISOString(),
-    status:"Pending",
-    messageId: message.id,
-    channelId: message.channelId
-  });
+    saveApplication({
+      ...application,
+      submittedAt:new Date().toISOString(),
+      status:"Pending",
+      messageId: message.id,
+      channelId: message.channelId
+    });
 
-  response.status(201).json({ ok: true, applicationId: application.id, messageUrl: message.url });
-});
-
-client.on("interactionCreate", async interaction => {
-  if(!interaction.isButton()) return;
-  if(!interaction.customId.startsWith("lsapp:")) return;
-
-  const [, action, applicationId] = interaction.customId.split(":");
-  const application = applications.get(applicationId);
-
-  if(!canReview(interaction.member)){
-    await interaction.reply({ content: "Энэ анкетыr шийдэх эрх байхгүй байна.", ephemeral: true });
-    return;
+    response.status(201).json({ ok: true, applicationId: application.id, messageUrl: message.url });
+  }catch(error){
+    console.error("/applications submit failed:", error);
+    response.status(500).json({ error: error.message || "Could not submit application" });
   }
-
-  if(!application){
-    await interaction.reply({ content: "Энэ application bot restart хийсний дараах хуучин анкет байна.", ephemeral: true });
-    return;
-  }
-
-  if(action === "history"){
-    await interaction.reply({ content: `Application ID: ${applicationId}\nStatus: ${application.status || "Pending"}`, ephemeral: true });
-    return;
-  }
-
-  if(action === "ticket"){
-    await interaction.reply({ content: "Ticket үүсгэх logic дараагийн хувилбарт нэмэгдэнэ.", ephemeral: true });
-    return;
-  }
-
-  const status = statusLabels[action] || "Reviewed";
-  application.status = status;
-  application.reviewedBy = interaction.user.id;
-  application.reviewedAt = new Date().toISOString();
-  saveApplication(application);
-
-  if(action.startsWith("accept") && ACCEPTED_ROLE_ID && application.applicant.discordId){
-    try{
-      const member = await interaction.guild.members.fetch(application.applicant.discordId);
-      await member.roles.add(ACCEPTED_ROLE_ID);
-    }catch(error){
-      console.warn("Could not add accepted role:", error.message);
-    }
-  }
-
-  if(application.applicant.discordId){
-    try{
-      const user = await client.users.fetch(application.applicant.discordId);
-      await user.send(`Таны LS Mongolia анкет: ${status}`);
-    }catch(error){
-      console.warn("Could not DM applicant:", error.message);
-    }
-  }
-
-  await interaction.update({
-    embeds: [applicationEmbed(application, status)],
-    components: actionRows(applicationId, true)
-  });
-});
-
-client.once("ready", () => {
-  loadApplicationsFromDisk();
-  console.log(`LS Mongolia application bot online as ${client.user.tag}`);
-});
-
-app.listen(PORT, () => {
-  console.log(`LS Mongolia application API listening on port ${PORT}`);
-});
-
-const discordToken = String(process.env.DISCORD_TOKEN || "")
-  .trim()
-  .replace(/^Bot\s+/i, "");
-
-if(!discordToken){
-  console.error("DISCORD_TOKEN is missing. Add it in Render Environment variables.");
-  process.exit(1);
-}
-
-client.login(discordToken).catch(error => {
-  console.error("Discord bot login failed:", error);
-  process.exit(1);
 });
